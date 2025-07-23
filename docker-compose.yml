@@ -1,0 +1,231 @@
+version: '3.8'
+
+services:
+  # Database
+  postgres:
+    image: postgres:13
+    container_name: pizza_violations_db
+    environment:
+      POSTGRES_DB: pizza_violations
+      POSTGRES_USER: pizza_admin
+      POSTGRES_PASSWORD: secure_pizza_2024
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pizza_admin -d pizza_violations"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Database Service
+  database_service:
+    build:
+      context: .
+      dockerfile: services/database/Dockerfile
+    container_name: pizza_database_service
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: pizza_violations
+      DB_USER: pizza_admin
+      DB_PASSWORD: secure_pizza_2024
+      DATABASE_PORT: 8005
+    ports:
+      - "8005:8005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Detection Service
+  detection_service:
+    build:
+      context: .
+      dockerfile: services/detection/Dockerfile
+    container_name: pizza_detection_service
+    environment:
+      MODEL_PATH: /app/models/yolo12m-v2.pt
+      CONFIDENCE_THRESHOLD: 0.2
+      IOU_THRESHOLD: 0.45
+      DEVICE: cpu
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./models:/app/models:ro
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Violation Detector Service
+  violation_detector:
+    build:
+      context: .
+      dockerfile: services/violation_detector/Dockerfile
+    container_name: pizza_violation_detector
+    environment:
+      TEMPORAL_WINDOW: 5
+      SCOOPER_PROXIMITY: 100.0
+      ROI_OVERLAP_THRESHOLD: 0.3
+      VIOLATION_CONFIDENCE: 0.7
+    ports:
+      - "8003:8003"
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ROI Manager Service
+  roi_manager:
+    build:
+      context: .
+      dockerfile: services/roi_manager/Dockerfile
+    container_name: pizza_roi_manager
+    ports:
+      - "8004:8004"
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frame Reader Service
+  frame_reader:
+    build:
+      context: .
+      dockerfile: services/frame_reader/Dockerfile
+    container_name: pizza_frame_reader
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./videos:/app/videos:ro
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
+
+  # Frontend
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    container_name: pizza_frontend
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api_gateway
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # RabbitMQ Message Broker
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: pizza_rabbitmq
+    ports:
+      - "5672:5672"    # AMQP port
+      - "15672:15672"  # Management UI port
+    environment:
+      RABBITMQ_DEFAULT_USER: pizza_admin
+      RABBITMQ_DEFAULT_PASS: pizza_password
+      RABBITMQ_DEFAULT_VHOST: pizza_store
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Message Broker Service
+  message_broker:
+    build:
+      context: .
+      dockerfile: services/message_broker/Dockerfile
+    container_name: pizza_message_broker
+    ports:
+      - "8010:8010"
+    environment:
+      RABBITMQ_URL: amqp://pizza_admin:pizza_password@rabbitmq:5672/pizza_store
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis (for caching)
+  redis:
+    image: redis:7-alpine
+    container_name: pizza_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - pizza_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
+
+volumes:
+  postgres_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+
+networks:
+  pizza_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

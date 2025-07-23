@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom styles for Remix Icons */
+@import 'remixicon/fonts/remixicon.css';
+
+/* Custom component styles */
+@layer components {
+  .status-online {
+    @apply animate-pulse;
+  }
+
+  .violation-alert {
+    @apply animate-shake;
+  }
+
+  .roi-overlay {
+    @apply absolute border-2 border-dashed border-primary bg-primary bg-opacity-10 pointer-events-none;
+  }
+
+  .card-shadow {
+    @apply shadow-soft;
+  }
+
+  .btn-primary {
+    @apply bg-primary hover:bg-primary-hover text-white font-medium px-4 py-2 rounded-button transition-colors duration-200;
+  }
+
+  .btn-secondary {
+    @apply bg-secondary hover:bg-secondary-hover text-white font-medium px-4 py-2 rounded-button transition-colors duration-200;
+  }
+
+  .input-field {
+    @apply px-3 py-2 border border-gray-300 rounded-button text-sm bg-white focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent;
+  }
+}
+
+/* Base styles */
+@layer base {
+  body {
+    @apply bg-gray-50 font-sans antialiased;
+  }
+
+  * {
+    @apply box-border;
+  }
+}

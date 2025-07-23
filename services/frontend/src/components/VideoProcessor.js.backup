@@ -1,0 +1,1270 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { useDropzone } from 'react-dropzone';
+import { toast } from 'react-toastify';
+import ROIZoneManager from './ROIZoneManager';
+import ViolationDetector from './ViolationDetector';
+import ViolationStatusOverlay from './VideoProcessor/ViolationStatusOverlay';
+
+const VideoProcessor = ({ onSessionUpdate, onDetectionUpdate, onViolationUpdate, currentSession }) => {
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingProgress, setProcessingProgress] = useState(0);
+  const [currentFrame, setCurrentFrame] = useState(null);
+  const [detections, setDetections] = useState([]);
+  const [violations, setViolations] = useState([]);
+  const [fps, setFps] = useState(10);
+  const [roiZones, setRoiZones] = useState([]);
+  const [showROIManager, setShowROIManager] = useState(false);
+  const [frameSize, setFrameSize] = useState({ width: 640, height: 480 });
+  const [drawingEnabled, setDrawingEnabled] = useState(true);
+  const [isFullScreen, setIsFullScreen] = useState(false);
+  
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const fullScreenCanvasRef = useRef(null);
+  const wsRef = useRef(null);
+
+  // Handle file drop
+  const onDrop = (acceptedFiles) => {
+    const file = acceptedFiles[0];
+    if (file && file.type.startsWith('video/')) {
+      setSelectedFile(file);
+      toast.success(`Video selected: ${file.name}`);
+    } else {
+      toast.error('Please select a valid video file');
+    }
+  };
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: {
+      'video/*': ['.mp4', '.avi', '.mov', '.mkv', '.webm']
+    },
+    multiple: false
+  });
+
+  // Start video processing
+  const startProcessing = async () => {
+    if (!selectedFile) {
+      toast.error('Please select a video file first');
+      return;
+    }
+
+    try {
+      console.log('🚀 Starting video processing...');
+      console.log('📁 Selected file:', selectedFile.name, selectedFile.size, 'bytes');
+
+      setIsProcessing(true);
+      setProcessingProgress(0);
+      setDetections([]);
+      setViolations([]);
+
+      // Upload video file first
+      console.log('📤 Uploading video file...');
+      const formData = new FormData();
+      formData.append('video', selectedFile);
+
+      const uploadResponse = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      console.log('📤 Upload response status:', uploadResponse.status);
+
+      if (!uploadResponse.ok) {
+        const errorText = await uploadResponse.text();
+        console.error('❌ Upload failed:', errorText);
+        throw new Error(`Failed to upload video: ${errorText}`);
+      }
+
+      const uploadResult = await uploadResponse.json();
+      console.log('✅ Upload successful:', uploadResult);
+
+      // Start video processing
+      console.log('🎬 Starting video processing...');
+      const processingRequest = {
+        source_type: 'file',
+        source_path: uploadResult.absolute_path,  // Use absolute path instead of just filename
+        fps: fps,
+        enable_violation_detection: true
+      };
+
+      console.log('📡 Processing request:', processingRequest);
+
+      const processingResponse = await fetch('/video/start', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(processingRequest)
+      });
+
+      console.log('🎬 Processing response status:', processingResponse.status);
+
+      if (!processingResponse.ok) {
+        const errorText = await processingResponse.text();
+        console.error('❌ Processing failed:', errorText);
+        throw new Error(`Failed to start video processing: ${errorText}`);
+      }
+
+      const result = await processingResponse.json();
+      console.log('✅ Processing started successfully:', result);
+      onSessionUpdate(result);
+
+      // Connect to WebSocket for real-time updates
+      if (result.websocket_url) {
+        console.log('🔌 Connecting to WebSocket:', result.websocket_url);
+        connectWebSocket(result.session_id, result.websocket_url);
+      } else {
+        console.log('🔌 Using default WebSocket URL for session:', result.session_id);
+        connectWebSocket(result.session_id);
+      }
+
+      toast.success('Video processing started successfully!');
+
+    } catch (error) {
+      console.error('❌ Processing error:', error);
+      toast.error(`Failed to start processing: ${error.message}`);
+      setIsProcessing(false);
+    }
+  };
+
+  // Connect to WebSocket for real-time updates
+  const connectWebSocket = (sessionId, wsUrl = null) => {
+    const websocketUrl = wsUrl || `ws://localhost:8001/ws/${sessionId}`;
+    console.log('🔌 Attempting WebSocket connection to:', websocketUrl);
+
+    wsRef.current = new WebSocket(websocketUrl);
+
+    wsRef.current.onopen = () => {
+      console.log('✅ WebSocket connected successfully');
+      toast.success('WebSocket connected - ready to receive frames');
+      toast.success('Connected to real-time feed');
+
+      // Send ping to keep connection alive
+      const pingInterval = setInterval(() => {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'ping' }));
+        } else {
+          clearInterval(pingInterval);
+        }
+      }, 30000); // Ping every 30 seconds
+    };
+
+    wsRef.current.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log('📨 WebSocket message received:', data.type, data);
+
+        if (data.type === 'connection_established') {
+          console.log('🔗 WebSocket connection established for session:', data.session_id);
+        }
+
+        if (data.type === 'frame_processed' || data.type === 'frame_update') {
+          console.log('🖼️ Frame processed:', data.frame_id, 'Detections:', data.detections?.length || 0);
+          console.log('📊 Frame data length:', data.frame_data?.length || 0);
+          console.log('🔍 Frame data type:', typeof data.frame_data);
+          console.log('🎯 Frame data preview:', data.frame_data?.substring(0, 50) + '...');
+
+          if (data.frame_data) {
+            setCurrentFrame(data.frame_data);
+            console.log('✅ Current frame updated successfully');
+          } else {
+            console.log('❌ No frame data received');
+          }
+          setProcessingProgress(data.progress || 0);
+
+          // Update detections
+          if (data.detections) {
+            setDetections(data.detections);
+            onDetectionUpdate(data);
+            console.log('🔍 Updated detections:', data.detections);
+
+            // Update frame size if available
+            if (data.frame_info && data.frame_info.dimensions) {
+              setFrameSize({
+                width: data.frame_info.dimensions.width,
+                height: data.frame_info.dimensions.height
+              });
+            }
+          }
+
+          // Update violations
+          if (data.violations && data.violations.length > 0) {
+            console.log('🚨 Violations detected:', data.violations);
+            setViolations(prev => [...prev, ...data.violations]);
+            data.violations.forEach(violation => {
+              onViolationUpdate(violation);
+              toast.error(`🚨 Violation Detected: ${violation.description}`);
+            });
+          }
+
+          // Draw detections on canvas
+          drawDetections(data.detections || [], false); // Normal canvas
+          if (isFullScreen) {
+            drawDetections(data.detections || [], true); // Full-screen canvas
+          }
+        }
+
+        if (data.type === 'processing_complete') {
+          console.log('✅ Video processing completed');
+          setIsProcessing(false);
+          setProcessingProgress(100);
+          toast.success('Video processing completed!');
+        }
+
+        if (data.type === 'pong') {
+          console.log('🏓 Pong received');
+        }
+
+      } catch (error) {
+        console.error('❌ WebSocket message error:', error);
+      }
+    };
+
+    wsRef.current.onclose = (event) => {
+      console.log('🔌 WebSocket disconnected. Code:', event.code, 'Reason:', event.reason);
+      setIsProcessing(false);
+
+      if (event.code !== 1000) { // Not a normal closure
+        toast.warning('Connection lost. Attempting to reconnect...');
+
+        // Attempt to reconnect after 3 seconds
+        setTimeout(() => {
+          if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+            console.log('🔄 Attempting to reconnect WebSocket...');
+            connectWebSocket(sessionId, websocketUrl);
+          }
+        }, 3000);
+      }
+    };
+
+    wsRef.current.onerror = (error) => {
+      console.error('❌ WebSocket error:', error);
+      toast.error('WebSocket connection error occurred');
+      setIsProcessing(false);
+    };
+  };
+
+  // Professional bounding box drawing with accurate coordinate transformation
+  const drawDetections = (detectionList, useFullScreenCanvas = false) => {
+    const canvas = useFullScreenCanvas ? fullScreenCanvasRef.current : canvasRef.current;
+    const img = videoRef.current;
+
+    if (!canvas || !img || !detectionList) {
+      console.log('🚫 Cannot draw detections: missing canvas, image, or detections');
+      return;
+    }
+
+    const ctx = canvas.getContext('2d');
+
+    // Get actual displayed image dimensions
+    const imgRect = img.getBoundingClientRect();
+    const displayWidth = imgRect.width;
+    const displayHeight = imgRect.height;
+
+    // Get natural image dimensions (original frame size)
+    const naturalWidth = img.naturalWidth || img.width;
+    const naturalHeight = img.naturalHeight || img.height;
+
+    // Set canvas size to match displayed image exactly
+    canvas.width = displayWidth;
+    canvas.height = displayHeight;
+    canvas.style.width = displayWidth + 'px';
+    canvas.style.height = displayHeight + 'px';
+
+    // Calculate scaling factors
+    const scaleX = displayWidth / naturalWidth;
+    const scaleY = displayHeight / naturalHeight;
+
+    console.log('📐 Drawing detections:', {
+      detections: detectionList.length,
+      naturalSize: `${naturalWidth}x${naturalHeight}`,
+      displaySize: `${displayWidth}x${displayHeight}`,
+      scale: `${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`
+    });
+
+    // Clear canvas
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Set high-quality rendering
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+
+    // Draw bounding boxes with proper scaling
+    detectionList.forEach((detection, index) => {
+      const { bbox, class_name, confidence } = detection;
+
+      // Transform coordinates from original frame to display coordinates
+      const x1 = bbox.x1 * scaleX;
+      const y1 = bbox.y1 * scaleY;
+      const x2 = bbox.x2 * scaleX;
+      const y2 = bbox.y2 * scaleY;
+
+      const width = x2 - x1;
+      const height = y2 - y1;
+
+      // Professional color scheme
+      const colors = {
+        'hand': { stroke: '#00D4FF', fill: 'rgba(0, 212, 255, 0.2)' },      // Bright cyan
+        'person': { stroke: '#FF6B9D', fill: 'rgba(255, 107, 157, 0.2)' },   // Pink
+        'scooper': { stroke: '#00FF88', fill: 'rgba(0, 255, 136, 0.2)' },    // Bright green
+        'pizza': { stroke: '#FFB800', fill: 'rgba(255, 184, 0, 0.2)' },      // Orange
+        'violation': { stroke: '#FF3333', fill: 'rgba(255, 51, 51, 0.3)' }   // Red
+      };
+
+      const colorScheme = colors[class_name] || colors['hand'];
+
+      // Draw filled background (optional, for better visibility)
+      ctx.fillStyle = colorScheme.fill;
+      ctx.fillRect(x1, y1, width, height);
+
+      // Draw main bounding box
+      ctx.strokeStyle = colorScheme.stroke;
+      ctx.lineWidth = Math.max(2, Math.min(4, width / 50)); // Adaptive line width
+      ctx.setLineDash([]);
+      ctx.strokeRect(x1, y1, width, height);
+
+      // Draw corner markers for better visibility
+      const cornerSize = Math.min(15, width / 8, height / 8);
+      ctx.lineWidth = Math.max(2, cornerSize / 4);
+
+      // Top-left corner
+      ctx.beginPath();
+      ctx.moveTo(x1, y1 + cornerSize);
+      ctx.lineTo(x1, y1);
+      ctx.lineTo(x1 + cornerSize, y1);
+      ctx.stroke();
+
+      // Top-right corner
+      ctx.beginPath();
+      ctx.moveTo(x2 - cornerSize, y1);
+      ctx.lineTo(x2, y1);
+      ctx.lineTo(x2, y1 + cornerSize);
+      ctx.stroke();
+
+      // Bottom-left corner
+      ctx.beginPath();
+      ctx.moveTo(x1, y2 - cornerSize);
+      ctx.lineTo(x1, y2);
+      ctx.lineTo(x1 + cornerSize, y2);
+      ctx.stroke();
+
+      // Bottom-right corner
+      ctx.beginPath();
+      ctx.moveTo(x2 - cornerSize, y2);
+      ctx.lineTo(x2, y2);
+      ctx.lineTo(x2, y2 - cornerSize);
+      ctx.stroke();
+
+      // Professional label with background
+      const label = `${class_name.toUpperCase()}: ${(confidence * 100).toFixed(1)}%`;
+      const fontSize = Math.max(12, Math.min(16, width / 10));
+      ctx.font = `bold ${fontSize}px 'Segoe UI', Arial, sans-serif`;
+
+      const textMetrics = ctx.measureText(label);
+      const textWidth = textMetrics.width;
+      const textHeight = fontSize;
+
+      const labelPadding = 6;
+      const labelX = x1;
+      const labelY = y1 - textHeight - labelPadding;
+
+      // Ensure label stays within canvas
+      const finalLabelY = labelY < 0 ? y1 + textHeight + labelPadding : labelY;
+
+      // Label background with rounded corners effect
+      ctx.fillStyle = colorScheme.stroke;
+      ctx.fillRect(labelX - 2, finalLabelY - 2, textWidth + labelPadding + 4, textHeight + labelPadding + 4);
+
+      // Label text
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillText(label, labelX + labelPadding/2, finalLabelY + textHeight);
+
+      // Add detection index for debugging
+      if (detectionList.length > 1) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(x2 - 20, y1, 20, 20);
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = 'bold 12px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText((index + 1).toString(), x2 - 10, y1 + 14);
+        ctx.textAlign = 'left';
+      }
+
+      console.log(`📦 Drew ${class_name} box:`, {
+        original: `(${bbox.x1}, ${bbox.y1}) -> (${bbox.x2}, ${bbox.y2})`,
+        scaled: `(${x1.toFixed(1)}, ${y1.toFixed(1)}) -> (${x2.toFixed(1)}, ${y2.toFixed(1)})`,
+        size: `${width.toFixed(1)}x${height.toFixed(1)}`,
+        confidence: `${(confidence * 100).toFixed(1)}%`
+      });
+    });
+
+    console.log(`✅ Drew ${detectionList.length} bounding boxes successfully`);
+  };
+
+  // Stop processing
+  const stopProcessing = async () => {
+    if (currentSession) {
+      try {
+        await fetch(`/video/stop/${currentSession.session_id}`, {
+          method: 'POST'
+        });
+        
+        if (wsRef.current) {
+          wsRef.current.close();
+        }
+        
+        setIsProcessing(false);
+        toast.info('Video processing stopped');
+      } catch (error) {
+        console.error('Stop processing error:', error);
+        toast.error('Failed to stop processing');
+      }
+    }
+  };
+
+  // Handle window resize to redraw bounding boxes
+  useEffect(() => {
+    const handleResize = () => {
+      console.log('🔄 Window resized, redrawing detections...');
+      // Redraw on normal canvas
+      setTimeout(() => drawDetections(detections, false), 100);
+      // Redraw on full-screen canvas if in full-screen mode
+      if (isFullScreen) {
+        setTimeout(() => drawDetections(detections, true), 100);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+    };
+  }, [detections, isFullScreen]);
+
+  // Redraw detections when detections change
+  useEffect(() => {
+    if (detections.length > 0 && currentFrame) {
+      console.log('🔄 Detections updated, redrawing...');
+      // Draw on normal canvas
+      setTimeout(() => drawDetections(detections, false), 50);
+      // Draw on full-screen canvas if in full-screen mode
+      if (isFullScreen) {
+        setTimeout(() => drawDetections(detections, true), 50);
+      }
+    }
+  }, [detections, currentFrame, isFullScreen]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []);
+
+  // Handle keyboard events for full-screen mode
+  useEffect(() => {
+    const handleKeyPress = (event) => {
+      if (event.key === 'Escape' && isFullScreen) {
+        setIsFullScreen(false);
+      }
+      if (event.key === 'f' && isProcessing && currentFrame && !isFullScreen) {
+        setIsFullScreen(true);
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyPress);
+    return () => {
+      document.removeEventListener('keydown', handleKeyPress);
+    };
+  }, [isFullScreen, isProcessing, currentFrame]);
+
+  // Redraw detections when entering/exiting full-screen mode
+  useEffect(() => {
+    if (detections.length > 0 && currentFrame) {
+      console.log('🔄 Full-screen mode changed, redrawing detections...');
+      setTimeout(() => {
+        if (isFullScreen) {
+          drawDetections(detections, true); // Draw on full-screen canvas
+        } else {
+          drawDetections(detections, false); // Draw on normal canvas
+        }
+      }, 100);
+    }
+  }, [isFullScreen]);
+
+  const handleZonesUpdate = (zones) => {
+    setRoiZones(zones);
+    console.log('🎯 ROI zones updated:', zones);
+  };
+
+  const handleViolationDetected = (violation) => {
+    console.log('🚨 Violation detected:', violation);
+    setViolations(prev => [...prev.slice(-9), violation]); // Keep last 10 violations
+    onViolationUpdate(violation);
+  };
+
+  return (
+    <div>
+      {/* ROI Zone Manager Toggle */}
+      <div className="card" style={{ marginBottom: '20px' }}>
+        <div className="card-header">
+          <h2 className="card-title">🎯 Zone Configuration</h2>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button
+              className={`btn ${showROIManager ? 'btn-warning' : 'btn-primary'}`}
+              onClick={() => setShowROIManager(!showROIManager)}
+            >
+              {showROIManager ? '📹 Back to Video' : '🎯 Configure Zones'}
+            </button>
+
+            {showROIManager && (
+              <button
+                className={`btn ${drawingEnabled ? 'btn-success' : 'btn-secondary'}`}
+                onClick={() => setDrawingEnabled(!drawingEnabled)}
+              >
+                {drawingEnabled ? '🎨 Drawing: ON' : '🔒 Drawing: OFF'}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {showROIManager && (
+          <div style={{ marginTop: '16px' }}>
+            <ROIZoneManager
+              currentFrame={currentFrame}
+              onZonesUpdate={handleZonesUpdate}
+              existingZones={roiZones}
+              isEnabled={drawingEnabled}
+              frameWidth={frameSize.width}
+              frameHeight={frameSize.height}
+            />
+          </div>
+        )}
+
+        {showROIManager && !currentFrame && (
+          <div style={{
+            padding: '40px',
+            textAlign: 'center',
+            background: 'rgba(255,255,255,0.1)',
+            borderRadius: '8px',
+            marginTop: '16px'
+          }}>
+            <div style={{ fontSize: '48px', marginBottom: '16px' }}>🎥</div>
+            <h3>Start Video Processing First</h3>
+            <p>Upload and start processing a video to configure ROI zones</p>
+          </div>
+        )}
+
+        {!showROIManager && roiZones.length > 0 && (
+          <div style={{ padding: '12px', background: 'rgba(0,255,136,0.1)', borderRadius: '6px' }}>
+            <span style={{ color: '#00FF88' }}>✅ {roiZones.length} zones configured</span>
+            <span style={{ marginLeft: '16px', fontSize: '14px', opacity: 0.8 }}>
+              Click "Configure Zones" to modify
+            </span>
+          </div>
+        )}
+
+
+      </div>
+
+      {/* Show full-page detection view when processing and full-screen enabled, otherwise show grid layout */}
+      {isProcessing && currentFrame && isFullScreen ? (
+        /* Full-page Real-time Detection & Violations */
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          width: '100vw',
+          height: '100vh',
+          background: '#1a1a1a',
+          zIndex: 1000,
+          overflow: 'auto',
+          overflowX: 'hidden',
+          scrollBehavior: 'smooth'
+        }}>
+          {/* Violation Messages Overlay - Always on top of video */}
+          <div style={{
+            position: 'absolute',
+            top: '20px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 1003,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '12px',
+            maxWidth: '95vw',
+            maxHeight: 'calc(100vh - 40px)',
+            overflowY: 'auto',
+            paddingBottom: '20px'
+          }}>
+            {/* Current Status Banner */}
+            <div style={{
+              background: violations.length > 0
+                ? 'linear-gradient(135deg, rgba(239, 68, 68, 0.95), rgba(220, 38, 38, 0.9))'
+                : 'linear-gradient(135deg, rgba(34, 197, 94, 0.95), rgba(22, 163, 74, 0.9))',
+              color: 'white',
+              padding: '16px 24px',
+              borderRadius: '12px',
+              border: violations.length > 0
+                ? '2px solid #ef4444'
+                : '2px solid #22c55e',
+              backdropFilter: 'blur(15px)',
+              boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4)',
+              textAlign: 'center',
+              minWidth: '500px',
+              animation: violations.length > 0 ? 'pulse 2s infinite' : 'none'
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '12px', marginBottom: '8px' }}>
+                <span style={{ fontSize: '28px' }}>
+                  {violations.length > 0 ? '🚨' : '✅'}
+                </span>
+                <strong style={{ fontSize: '20px', letterSpacing: '1px' }}>
+                  {violations.length > 0
+                    ? `${violations.length} ACTIVE VIOLATION${violations.length > 1 ? 'S' : ''} DETECTED`
+                    : 'MONITORING ACTIVE - NO VIOLATIONS'
+                  }
+                </strong>
+              </div>
+              <div style={{ fontSize: '16px', opacity: 0.95, marginBottom: '8px' }}>
+                {violations.length > 0
+                  ? 'Immediate attention required - Food safety protocol breach detected'
+                  : 'All workers following proper scooper usage protocols'
+                }
+              </div>
+              <div style={{ fontSize: '14px', opacity: 0.9, marginBottom: '8px' }}>
+                Detection Status: Active | Sensitivity: Medium | Zones: {roiZones.length} configured
+              </div>
+
+              {/* Real-time Activity Status */}
+              <div style={{
+                fontSize: '14px',
+                opacity: 0.95,
+                padding: '6px 12px',
+                background: 'rgba(255, 255, 255, 0.15)',
+                borderRadius: '6px',
+                border: '1px solid rgba(255, 255, 255, 0.2)'
+              }}>
+                <strong>Current Activity:</strong> {
+                  detections.length === 0
+                    ? '🔍 Scanning for activity'
+                    : `👥 Tracking: ${detections.filter(d => d.class_name?.toLowerCase().includes('person') || d.class_name?.toLowerCase().includes('worker')).length} worker(s), ${detections.filter(d => d.class_name?.toLowerCase().includes('hand')).length} hand(s), ${detections.filter(d => d.class_name?.toLowerCase().includes('spoon') || d.class_name?.toLowerCase().includes('scooper')).length} scooper(s)`
+                }
+              </div>
+            </div>
+
+            {/* Active Violations List */}
+            {violations.length > 0 && (
+              <div style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '8px'
+              }}>
+                {violations.slice(-3).reverse().map((violation, index) => (
+                  <div key={violation.id || index} style={{
+                    background: 'linear-gradient(135deg, rgba(239, 68, 68, 0.95), rgba(220, 38, 38, 0.9))',
+                    color: 'white',
+                    padding: '14px 20px',
+                    borderRadius: '10px',
+                    border: '2px solid #ef4444',
+                    backdropFilter: 'blur(10px)',
+                    boxShadow: '0 4px 16px rgba(239, 68, 68, 0.4)',
+                    animation: index === 0 ? 'slideIn 0.5s ease-out' : 'none'
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
+                      <span style={{ fontSize: '20px' }}>⚠️</span>
+                      <strong style={{ fontSize: '16px' }}>
+                        VIOLATION #{violations.length - index}
+                      </strong>
+                      <span style={{
+                        background: 'rgba(255, 255, 255, 0.25)',
+                        padding: '3px 8px',
+                        borderRadius: '12px',
+                        fontSize: '11px',
+                        fontWeight: 'bold'
+                      }}>
+                        {violation.severity?.toUpperCase() || 'HIGH'}
+                      </span>
+                      <span style={{
+                        fontSize: '12px',
+                        opacity: 0.9,
+                        marginLeft: 'auto'
+                      }}>
+                        {new Date(violation.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+
+                    <div style={{ fontSize: '15px', fontWeight: '500', marginBottom: '4px' }}>
+                      {violation.violation_type || violation.type || 'SCOOPER USAGE VIOLATION'}
+                    </div>
+
+                    <div style={{ fontSize: '14px', opacity: 0.95, marginBottom: '6px' }}>
+                      {violation.description || 'Worker hand detected in ingredient area without proper scooper usage'}
+                    </div>
+
+                    <div style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      fontSize: '12px',
+                      opacity: 0.85
+                    }}>
+                      <span>Confidence: {((violation.confidence || 0.8) * 100).toFixed(1)}%</span>
+                      <span>Zone: {violation.zone || violation.location || 'Ingredient Area'}</span>
+                      <span>Duration: {violation.duration || '2.3s'}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Object Detection Summary */}
+            {detections.length > 0 && (
+              <div style={{
+                background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.9), rgba(37, 99, 235, 0.85))',
+                color: 'white',
+                padding: '12px 18px',
+                borderRadius: '8px',
+                border: '2px solid #3b82f6',
+                backdropFilter: 'blur(10px)',
+                fontSize: '14px',
+                textAlign: 'center',
+                boxShadow: '0 4px 16px rgba(59, 130, 246, 0.3)'
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', marginBottom: '4px' }}>
+                  <span style={{ fontSize: '16px' }}>🔍</span>
+                  <strong>OBJECT DETECTION ACTIVE</strong>
+                </div>
+                <div style={{ fontSize: '13px', opacity: 0.95 }}>
+                  Currently tracking: {detections.filter(d => d.class_name?.toLowerCase().includes('person') || d.class_name?.toLowerCase().includes('worker')).length} worker(s),
+                  {detections.filter(d => d.class_name?.toLowerCase().includes('hand')).length} hand(s),
+                  {detections.filter(d => d.class_name?.toLowerCase().includes('spoon') || d.class_name?.toLowerCase().includes('scooper')).length} scooper(s)
+                </div>
+                <div style={{ fontSize: '12px', opacity: 0.8, marginTop: '4px' }}>
+                  Total objects detected: {detections.length} | Confidence threshold: 70%
+                </div>
+              </div>
+            )}
+
+            {/* Scroll Indicator */}
+            {(violations.length > 2 || detections.length > 0) && (
+              <div style={{
+                position: 'fixed',
+                bottom: '30px',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                zIndex: 1003,
+                background: 'rgba(255, 255, 255, 0.1)',
+                color: 'white',
+                padding: '8px 16px',
+                borderRadius: '20px',
+                fontSize: '12px',
+                backdropFilter: 'blur(10px)',
+                border: '1px solid rgba(255, 255, 255, 0.2)',
+                animation: 'bounce 2s infinite'
+              }}>
+                ⬇️ Scroll down for more information ⬇️
+              </div>
+            )}
+          </div>
+
+          {/* Close button */}
+          <button
+            onClick={() => setIsFullScreen(false)}
+            title="Exit Full Screen (Press Escape)"
+            style={{
+              position: 'fixed',
+              top: '20px',
+              right: '20px',
+              zIndex: 1004,
+              background: 'rgba(255, 255, 255, 0.2)',
+              border: '2px solid rgba(255, 255, 255, 0.3)',
+              borderRadius: '50%',
+              width: '50px',
+              height: '50px',
+              color: 'white',
+              fontSize: '20px',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              backdropFilter: 'blur(10px)',
+              transition: 'all 0.3s ease'
+            }}
+            onMouseEnter={(e) => {
+              e.target.style.background = 'rgba(255, 255, 255, 0.3)';
+              e.target.style.transform = 'scale(1.1)';
+            }}
+            onMouseLeave={(e) => {
+              e.target.style.background = 'rgba(255, 255, 255, 0.2)';
+              e.target.style.transform = 'scale(1)';
+            }}
+          >
+            ✕
+          </button>
+
+          {/* Full-screen video with overlays */}
+          <div style={{
+            width: '100%',
+            minHeight: '100vh',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '400px 20px 100px 20px', // More padding for messages and scrolling
+            boxSizing: 'border-box'
+          }}>
+            <div style={{
+              position: 'relative',
+              maxWidth: '100%',
+              maxHeight: '100%',
+              width: 'auto',
+              height: 'auto'
+            }}>
+              <img
+                ref={videoRef}
+                src={`data:image/jpeg;base64,${currentFrame}`}
+                alt="Current frame"
+                style={{
+                  maxWidth: '100%',
+                  maxHeight: '100%',
+                  width: 'auto',
+                  height: 'auto',
+                  borderRadius: '12px',
+                  boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)'
+                }}
+                onLoad={() => {
+                  console.log('🖼️ Full-screen image loaded, updating frame size...');
+                  const img = videoRef.current;
+                  if (img) {
+                    const rect = img.getBoundingClientRect();
+                    setFrameSize({
+                      width: img.naturalWidth || rect.width,
+                      height: img.naturalHeight || rect.height
+                    });
+                  }
+                  setTimeout(() => drawDetections(detections, true), 50); // Use full-screen canvas
+                }}
+              />
+
+              {/* Detection Canvas for Bounding Boxes in Full-Screen */}
+              <canvas
+                ref={fullScreenCanvasRef}
+                className="detection-canvas"
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  pointerEvents: 'none',
+                  borderRadius: '12px',
+                  zIndex: 10
+                }}
+              />
+
+              {/* ROI Zones Overlay */}
+              {roiZones.length > 0 && (
+                <ROIZoneManager
+                  currentFrame={currentFrame}
+                  onZonesUpdate={() => {}}
+                  existingZones={roiZones}
+                  isEnabled={false}
+                  frameWidth={frameSize.width}
+                  frameHeight={frameSize.height}
+                />
+              )}
+
+              {/* Violation Detection Overlay */}
+              {roiZones.length > 0 && (
+                <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 40 }}>
+                  <ViolationDetector
+                    detections={detections}
+                    zones={roiZones}
+                    frameWidth={frameSize.width}
+                    frameHeight={frameSize.height}
+                    onViolationDetected={handleViolationDetected}
+                    hideControls={true}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Processing status overlay */}
+          <div style={{
+            position: 'fixed',
+            bottom: '20px',
+            left: '20px',
+            background: 'rgba(0, 0, 0, 0.8)',
+            color: 'white',
+            padding: '12px 20px',
+            borderRadius: '8px',
+            backdropFilter: 'blur(10px)',
+            border: '1px solid rgba(255, 255, 255, 0.2)'
+          }}>
+            <div style={{ fontSize: '14px', marginBottom: '4px' }}>
+              🎬 Processing: {processingProgress.toFixed(1)}%
+            </div>
+            <div style={{ fontSize: '12px', opacity: 0.8 }}>
+              Detections: {detections.length} | Violations: {violations.length}
+            </div>
+          </div>
+
+          {/* CSS Animations */}
+          <style jsx>{`
+            @keyframes pulse {
+              0% { transform: scale(1); }
+              50% { transform: scale(1.02); }
+              100% { transform: scale(1); }
+            }
+
+            @keyframes slideIn {
+              0% {
+                transform: translateY(-20px);
+                opacity: 0;
+              }
+              100% {
+                transform: translateY(0);
+                opacity: 1;
+              }
+            }
+
+            @keyframes glow {
+              0% { box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4); }
+              50% { box-shadow: 0 8px 32px rgba(239, 68, 68, 0.6); }
+              100% { box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4); }
+            }
+
+            @keyframes bounce {
+              0%, 20%, 50%, 80%, 100% { transform: translateX(-50%) translateY(0); }
+              40% { transform: translateX(-50%) translateY(-10px); }
+              60% { transform: translateX(-50%) translateY(-5px); }
+            }
+          `}</style>
+        </div>
+      ) : (
+        /* Normal grid layout when not processing */
+        <div className="grid grid-2">
+          {/* Video Upload and Controls */}
+          <div className="card">
+            <div className="card-header">
+              <h2 className="card-title">🎥 Video Processing</h2>
+            </div>
+        
+        {!selectedFile ? (
+          <div {...getRootProps()} className={`upload-area ${isDragActive ? 'drag-over' : ''}`}>
+            <input {...getInputProps()} />
+            <div style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: '48px', marginBottom: '16px' }}>📁</div>
+              <h3>Drop video file here or click to browse</h3>
+              <p>Supports MP4, AVI, MOV, MKV, WebM</p>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <div style={{ marginBottom: '20px', padding: '16px', background: 'rgba(255,255,255,0.1)', borderRadius: '8px' }}>
+              <h4>📹 Selected Video:</h4>
+              <p><strong>Name:</strong> {selectedFile.name}</p>
+              <p><strong>Size:</strong> {(selectedFile.size / 1024 / 1024).toFixed(2)} MB</p>
+              <p><strong>Type:</strong> {selectedFile.type}</p>
+            </div>
+            
+            <div style={{ marginBottom: '20px' }}>
+              <label style={{ display: 'block', marginBottom: '8px' }}>
+                <strong>Processing FPS:</strong>
+              </label>
+              <input
+                type="range"
+                min="1"
+                max="30"
+                value={fps}
+                onChange={(e) => setFps(parseInt(e.target.value))}
+                style={{ width: '100%', marginBottom: '8px' }}
+              />
+              <span>{fps} FPS</span>
+            </div>
+            
+            <div style={{ display: 'flex', gap: '12px' }}>
+              {!isProcessing ? (
+                <>
+                  <button className="btn btn-success" onClick={startProcessing}>
+                    ▶️ Start Processing
+                  </button>
+                  <button className="btn btn-warning" onClick={() => setSelectedFile(null)}>
+                    🔄 Select Different Video
+                  </button>
+                </>
+              ) : (
+                <button className="btn btn-danger" onClick={stopProcessing}>
+                  ⏹️ Stop Processing
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+        
+        {isProcessing && (
+          <div style={{ marginTop: '20px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+              <span>Processing Progress</span>
+              <span>{processingProgress.toFixed(1)}%</span>
+            </div>
+            <div className="progress-bar">
+              <div 
+                className="progress-fill" 
+                style={{ width: `${processingProgress}%` }}
+              ></div>
+            </div>
+          </div>
+        )}
+          </div>
+
+          {/* Real-time Video Display with ROI and Violations - Normal View */}
+          <div className="card">
+            <div className="card-header">
+              <h2 className="card-title">🔍 Real-time Detection & Violations</h2>
+              {currentFrame && (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => setIsFullScreen(true)}
+                  style={{ marginLeft: 'auto' }}
+                  title="Full Screen (Press F or click)"
+                >
+                  🔍 Full Screen
+                </button>
+              )}
+            </div>
+
+            <div className="video-container">
+              {currentFrame ? (
+                <div style={{
+                  position: 'relative',
+                  display: 'inline-block',
+                  width: '100%',
+                  maxWidth: '100%'
+                }}>
+                  <img
+                    ref={videoRef}
+                    src={`data:image/jpeg;base64,${currentFrame}`}
+                    alt="Current frame"
+                    style={{
+                      width: '100%',
+                      height: 'auto',
+                      borderRadius: '8px',
+                      display: 'block',
+                      maxWidth: '100%'
+                    }}
+                    onLoad={() => {
+                      console.log('🖼️ Image loaded, updating frame size...');
+                      const img = videoRef.current;
+                      if (img) {
+                        const rect = img.getBoundingClientRect();
+                        setFrameSize({
+                          width: img.naturalWidth || rect.width,
+                          height: img.naturalHeight || rect.height
+                        });
+                        console.log('📐 Frame size updated:', {
+                          natural: `${img.naturalWidth}x${img.naturalHeight}`,
+                          display: `${rect.width}x${rect.height}`
+                        });
+                      }
+                      // Small delay to ensure image is fully rendered
+                      setTimeout(() => drawDetections(detections), 50);
+                    }}
+                    onError={(e) => {
+                      console.error('❌ Image load error:', e);
+                }}
+              />
+              <canvas
+                ref={canvasRef}
+                className="detection-canvas"
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  pointerEvents: 'none',
+                  borderRadius: '8px',
+                  zIndex: 10
+                }}
+              />
+
+              {/* ROI Zones Overlay in Real-time View */}
+              {!showROIManager && roiZones.length > 0 && (
+                <ROIZoneManager
+                  currentFrame={currentFrame}
+                  onZonesUpdate={() => {}} // Read-only in real-time view
+                  existingZones={roiZones}
+                  isEnabled={false} // Read-only overlay
+                  frameWidth={frameSize.width}
+                  frameHeight={frameSize.height}
+                />
+              )}
+
+              {/* Violation Detection Overlay - Visual Only */}
+              {!showROIManager && roiZones.length > 0 && (
+                <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none', zIndex: 40 }}>
+                  <ViolationDetector
+                    detections={detections}
+                    zones={roiZones}
+                    frameWidth={frameSize.width}
+                    frameHeight={frameSize.height}
+                    onViolationDetected={handleViolationDetected}
+                    hideControls={true}
+                  />
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'center', 
+              height: '300px',
+              background: 'rgba(0,0,0,0.3)',
+              borderRadius: '8px'
+            }}>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: '48px', marginBottom: '16px' }}>📺</div>
+                <p>Video feed will appear here during processing</p>
+              </div>
+            </div>
+          )}
+        </div>
+
+
+
+        {/* Zone Status Indicator */}
+        {!showROIManager && roiZones.length > 0 && (
+          <div style={{
+            marginTop: '12px',
+            padding: '8px 12px',
+            background: 'rgba(0,255,136,0.2)',
+            borderRadius: '6px',
+            border: '2px solid #00FF88'
+          }}>
+            <span style={{ color: '#00FF88', fontWeight: 'bold' }}>
+              🎯 {roiZones.length} ROI Zone{roiZones.length > 1 ? 's' : ''} Active | Violation Detection: ON
+            </span>
+          </div>
+        )}
+
+        {!showROIManager && roiZones.length === 0 && (
+          <div style={{
+            marginTop: '12px',
+            padding: '8px 12px',
+            background: 'rgba(255,210,63,0.2)',
+            borderRadius: '6px',
+            border: '2px solid #FFD23F'
+          }}>
+            <span style={{ color: '#FFD23F', fontWeight: 'bold' }}>
+              ⚠️ No ROI Zones Configured | Click "🎯 Configure Zones" to set up violation detection
+            </span>
+          </div>
+        )}
+
+        {/* Detection Stats */}
+        {detections.length > 0 && (
+          <div style={{ marginTop: '16px' }}>
+            <h4>Current Detections ({detections.length}):</h4>
+            <div className="detection-list" style={{ maxHeight: '150px', overflowY: 'auto' }}>
+              {detections.map((detection, index) => (
+                <div key={index} className={`detection-item ${detection.class_name}`}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <strong>{detection.class_name.toUpperCase()}</strong>
+                    <span style={{
+                      background: detection.class_name === 'hand' ? '#00D4FF' :
+                                detection.class_name === 'person' ? '#FF6B9D' :
+                                detection.class_name === 'scooper' ? '#00FF88' :
+                                detection.class_name === 'pizza' ? '#FFB800' : '#666',
+                      color: 'white',
+                      padding: '2px 6px',
+                      borderRadius: '4px',
+                      fontSize: '12px'
+                    }}>
+                      {(detection.confidence * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <small style={{ opacity: 0.8 }}>
+                    Box: ({detection.bbox.x1.toFixed(0)}, {detection.bbox.y1.toFixed(0)}) →
+                    ({detection.bbox.x2.toFixed(0)}, {detection.bbox.y2.toFixed(0)})
+                    <br />
+                    Size: {detection.bbox.width?.toFixed(0) || (detection.bbox.x2 - detection.bbox.x1).toFixed(0)}×
+                    {detection.bbox.height?.toFixed(0) || (detection.bbox.y2 - detection.bbox.y1).toFixed(0)}px
+                  </small>
+                </div>
+              ))}
+            </div>
+
+
+          </div>
+        )}
+        
+        {/* Violation Alerts */}
+        {violations.length > 0 && (
+          <div style={{ marginTop: '16px' }}>
+            <h4 style={{ color: '#ef4444' }}>🚨 Recent Violations:</h4>
+            <div style={{ maxHeight: '100px', overflowY: 'auto' }}>
+              {violations.slice(-3).map((violation, index) => (
+                <div key={index} className="violation-alert">
+                  <strong>{violation.violation_type}</strong>
+                  <br />
+                  <small>{violation.description}</small>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+          </div>
+        </div>
+      )}
+
+      {/* Violation Detection Settings Panel - Only show in normal view */}
+      {!isProcessing && roiZones.length > 0 && (
+        <div className="card" style={{ marginTop: '20px' }}>
+          <div className="card-header">
+            <h2 className="card-title">🚨 Violation Detection Controls</h2>
+          </div>
+          <ViolationDetector
+            detections={detections}
+            zones={roiZones}
+            frameWidth={frameSize.width}
+            frameHeight={frameSize.height}
+            onViolationDetected={handleViolationDetected}
+            showControlsOnly={true}
+          />
+        </div>
+      )}
+
+    {/* Violation History Panel - Only show in normal view */}
+    {!isProcessing && violations.length > 0 && (
+      <div className="card" style={{ marginTop: '20px' }}>
+        <div className="card-header">
+          <h2 className="card-title">📋 Violation History</h2>
+        </div>
+        <div style={{ maxHeight: '200px', overflowY: 'auto' }}>
+          {violations.slice(-5).reverse().map((violation, index) => (
+            <div key={violation.id || index} className="violation-alert" style={{ marginBottom: '8px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <strong>{violation.violation_type || violation.type}</strong>
+                <span style={{ fontSize: '12px', opacity: 0.8 }}>
+                  {new Date(violation.timestamp).toLocaleTimeString()}
+                </span>
+              </div>
+              <p style={{ margin: '4px 0', fontSize: '14px' }}>
+                {violation.description}
+              </p>
+              <div style={{ fontSize: '12px', opacity: 0.7 }}>
+                Confidence: {((violation.confidence || 0) * 100).toFixed(1)}% |
+                Severity: {violation.severity || 'medium'}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    )}
+  </div>
+  );
+};
+
+export default VideoProcessor;
